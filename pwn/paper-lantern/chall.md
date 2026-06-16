@@ -15,7 +15,7 @@
 ```bash
 ls -la
 ````
-![recon__ban_dau](./assets/1)
+![recon__ban_dau](./assets/1.png)
 
 Kết quả cho thấy challenge có ba file chính:
 
