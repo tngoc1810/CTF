@@ -1321,7 +1321,7 @@ Chạy script:
 [tinh_pqd.py](./scripts/2.py)
 
 ```bash
-python3 solve_paper_lantern.py 178.105.199.41 20000
+python3 key.py 178.105.199.41 20000 
 ```
 
 Output:
@@ -1412,6 +1412,10 @@ Server chạy unsafe opcode
 Khi chạy phần forge forbidden capsule, script in ra thông tin capsule và signature:
 
 [solve.py](./scripts/3.py)
+
+```bash
+python3 solve.py 178.105.199.41 20000 --key paper_lantern_key.json
+```
 
 ![python](./assets/20.png)
 
