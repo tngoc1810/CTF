@@ -396,6 +396,326 @@ RT_ERR      → debug lỗi nếu gửi sai
 
 Đây là nền để tiếp tục phân tích cơ chế capsule và signature ở các bước sau.
 
+## 6. Phân tích `public_params.json` và nghi ngờ RSA-CRT
+
+Sau khi hiểu sơ bộ protocol frame, mình quay lại đọc kỹ file `public_params.json`:
+
+```bash
+cat public_params.json
+```
+
+Output:
+
+![python](./assets/7.png)
+
+```json
+{
+  "scheme": "crt-rsa-fdh",
+  "n": "70a80f885c9cab9c3a4b068b58ee1913d472f2f750c2023ff0b00426f70b1e5d91535a03f66410614806025ed7cc2c2ff904d8aa516612cb0936bd05a90a3159",
+  "e": 65537,
+  "signature_size": 64,
+  "trace_max_read": 24,
+  "audit_window": 192,
+  "trace_render_offset": 112,
+  "replay_buf": 72,
+  "comment_braid_min": 17,
+  "comment_braid_max": 32,
+  "decoy_table": 8
+}
+```
+
+Dòng đầu tiên rất đáng chú ý:
+
+```json
+"scheme": "crt-rsa-fdh"
+```
+
+Ở đây có thể tách thành hai phần:
+
+```text
+crt-rsa-fdh
+│   │   │
+│   │   └── FDH = Full Domain Hash
+│   └────── RSA signature
+└────────── CRT optimization
+```
+
+Điều này cho thấy bài đang dùng **RSA signature** để xác thực dữ liệu. Cụ thể hơn, đây là RSA dùng CRT để tối ưu tốc độ ký.
+
+Trong RSA, public key thường có dạng:
+
+```text
+public key = (n, e)
+```
+
+Trong file JSON, ta thấy:
+
+```json
+"e": 65537
+```
+
+`65537` là public exponent rất phổ biến trong RSA.
+
+Ta cũng có modulus `n`:
+
+```text
+n = 70a80f885c9cab9c3a4b068b58ee1913d472f2f750c2023ff0b00426f70b1e5d91535a03f66410614806025ed7cc2c2ff904d8aa516612cb0936bd05a90a3159
+```
+
+Về mặt toán học:
+
+```text
+n = p * q
+```
+
+Nhưng ở thời điểm này, mình chỉ biết `n` và `e`, chưa biết `p`, `q`, cũng chưa biết private key `d`.
+
+Dòng tiếp theo cũng rất quan trọng:
+
+```json
+"signature_size": 64
+```
+
+Signature dài 64 bytes, tương đương 512-bit. Điều này khớp với kích thước của modulus RSA trong bài.
+
+Tới đây mình có suy nghĩ:
+
+```text
+Service dùng RSA signature
+        ↓
+Muốn chạy capsule có thể cần chữ ký hợp lệ
+        ↓
+Mình có public key (n, e)
+        ↓
+Nhưng chưa có private key
+        ↓
+Cần tìm lỗi để lấy chữ ký hoặc khôi phục private key
+```
+
+---
+
+## 7. Chú ý đến `replay_buf`
+
+Trong file JSON còn có một trường khá lạ:
+
+```json
+"replay_buf": 72
+```
+
+Ban đầu mình chưa biết chính xác `replay_buf` dùng để làm gì. Tuy nhiên, vì đây là một bài Pwn/Crypto nên một buffer size cụ thể như `72` thường là manh mối đáng để chú ý.
+
+Một số hướng nghi ngờ ban đầu của mình là:
+
+```text
+replay_buf = 72
+        ↓
+Có thể liên quan đến buffer xử lý replay
+        ↓
+Có thể có lỗi boundary check
+        ↓
+Có thể có overflow / off-by-one / state corruption
+```
+
+Ngoài ra, các trường như:
+
+```json
+"trace_render_offset": 112,
+"audit_window": 192
+```
+
+cũng gợi ý rằng chương trình có nhiều vùng dữ liệu nội bộ liên quan đến trace, audit hoặc replay. Vì vậy mình tạm ghi chú lại các giá trị này để quay lại sau khi hiểu rõ hơn về format capsule.
+
+---
+
+## 8. Hiểu sơ bộ khái niệm capsule
+
+Trong file Python, mình thấy có hàm tạo record dạng raw:
+
+![python](./assets/8.png)
+
+```python
+def rec_raw(kind: int, payload: bytes = b"") -> bytes:
+    if not 0 <= kind <= 0xFF:
+        raise ValueError("record kind must fit in one byte")
+    return bytes([kind]) + payload
+```
+
+Hàm này cho thấy mỗi record bên trong capsule có format rất đơn giản:
+
+```text
+[kind:1][payload]
+```
+
+Trong đó `kind` chỉ được phép nằm trong khoảng một byte:
+
+```text
+0x00 <= kind <= 0xFF
+```
+
+Lúc này mình hiểu `capsule` có thể được xem như một container chứa nhiều record nhỏ. Mỗi record có một `kind` riêng, còn payload phía sau sẽ được chương trình xử lý tùy theo loại record đó.
+
+Nói đơn giản:
+
+```text
+Capsule
+  ├── record 1: kind + payload
+  ├── record 2: kind + payload
+  └── record 3: kind + payload
+```
+
+Điều này làm mình nghĩ rằng muốn chạy được hành vi đặc biệt trên server, ta cần tìm đúng `kind` hoặc opcode mà chương trình hỗ trợ.
+
+---
+
+## 9. Tìm opcode đáng ngờ bằng `strings`
+
+Để kiểm tra lại các chuỗi đáng chú ý trong binary, mình chạy:
+
+```bash
+strings paper_lantern
+```
+
+Trong output có một số chuỗi rất đáng chú ý:
+
+![python](./assets/9.png)
+
+```text
+/app/flag.txt
+unsafe opcode
+bad replay patch
+bad replay literal
+bad replay repeat
+bad replay backref
+bad replay distance
+replay lane jammed
+bad replay xor
+bad replay braid
+braid exceeds seam
+unknown replay op
+replay sealed
+bad opcode
+```
+
+Ở đây có hai manh mối quan trọng.
+
+Thứ nhất, binary có nhắc tới:
+
+```text
+/app/flag.txt
+```
+
+Điều này củng cố giả thuyết rằng flag nằm trên remote server tại đường dẫn `/app/flag.txt`, chứ không nằm trong binary local.
+
+Thứ hai, có chuỗi:
+
+```text
+unsafe opcode
+bad opcode
+```
+
+Điều này cho thấy bên trong capsule có tồn tại opcode bị chặn. Nếu gửi opcode không hợp lệ hoặc opcode nhạy cảm, server sẽ từ chối.
+
+Từ đây, mình chuyển sang hướng tìm opcode:
+
+```text
+Capsule dùng record kind 1 byte
+        ↓
+Có lỗi "bad opcode" / "unsafe opcode"
+        ↓
+Cần tìm opcode nào được chương trình xử lý đặc biệt
+        ↓
+Nếu opcode đó liên quan đến flag thì cần bypass cơ chế signature
+```
+
+---
+
+## 10. Brute force thử record kind / opcode
+
+Vì `rec_raw()` giới hạn `kind` trong một byte, mình thử viết script để test các giá trị opcode trong khoảng `0x00` đến `0xFF`.
+
+Ý tưởng là:
+
+```text
+Tạo capsule mới
+        ↓
+Append record với kind/opcode đang test
+        ↓
+Gửi SIGN
+        ↓
+Quan sát response của server
+```
+
+Trong quá trình test, mình thấy một payload đáng chú ý là:
+
+```text
+7f03
+```
+
+Khi gửi payload này bằng frame `FT_APPEND`, server chấp nhận append:
+
+```text
+[APPEND] type=0x21 seq=3 len=2 payload=7f03
+[after APPEND] type=RT_OK seq=0 len=16
+    payload_hex  = 7265636f72647320170656e646564
+    payload_text = 'records appended'
+```
+
+Nhưng khi xin chữ ký bằng `FT_SIGN`, server trả lỗi:
+
+```text
+[SIGN] type=0x22 seq=4 len=0 payload=
+[after SIGN] type=RT_ERR seq=0 len=13
+    payload_hex  = 756e73616665206f70636f6465
+    payload_text = 'unsafe opcode'
+```
+
+Đây là phát hiện rất quan trọng.
+
+Nó chứng minh rằng `7f03` không phải payload bình thường. Server nhận ra nó là một opcode nguy hiểm và không cho ký.
+
+Tức là:
+
+```text
+Payload 7f03
+        ↓
+Append được vào capsule
+        ↓
+Nhưng khi SIGN thì bị chặn
+        ↓
+Server báo "unsafe opcode"
+```
+
+Lúc này mình hiểu rằng hướng đi đúng không phải là xin server ký trực tiếp payload này. Vì cơ chế kiểm tra của server đã phát hiện đây là unsafe opcode.
+
+Thay vào đó, ta cần một cách khác để có chữ ký hợp lệ cho capsule chứa unsafe opcode.
+
+---
+
+## 11. Kết luận sau bước opcode recon
+
+Tới đây, mình có các kết luận quan trọng:
+
+1. Service dùng RSA signature theo scheme `crt-rsa-fdh`.
+2. Public key có dạng `(n, e)` với `e = 65537`.
+3. Signature dài 64 bytes, khớp RSA 512-bit.
+4. Capsule có các record dạng `kind + payload`.
+5. Binary có nhắc tới `/app/flag.txt`, `unsafe opcode`, `bad opcode`.
+6. Payload `7f03` bị server nhận diện là `unsafe opcode`.
+7. Server không cho ký trực tiếp capsule chứa opcode này.
+
+Do đó, bài toán chuyển thành:
+
+```text
+Làm sao tạo chữ ký hợp lệ cho capsule chứa unsafe opcode 7f03
+nếu server không chịu ký trực tiếp capsule đó?
+```
+
+Đây là điểm nối sang phần khai thác RSA-CRT ở bước sau.
+
+Script dùng để test bước này:
+
+[01_test_safe_signature.py](./scripts/1.py)
+
 
 
 
