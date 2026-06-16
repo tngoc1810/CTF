@@ -716,22 +716,716 @@ Script dùng để test bước này:
 
 [01_test_safe_signature.py](./scripts/1.py)
 
+## 12. Test capsule hợp lệ trước khi đụng tới unsafe opcode
 
+Sau khi xác định `0x7f` nhiều khả năng là opcode đáng chú ý, mình tạm xem đây là mốc quan trọng. Nếu hướng này sai thì mình sẽ quay lại đây để rẽ sang hướng khác.
 
+Đến thời điểm này mình đã phân tích khá nhiều:
 
-## 16. Scripts
+- Service dùng protocol frame riêng.
+- Capsule cần được append bằng `FT_APPEND`.
+- Capsule muốn chạy hoặc ký phải đi qua `FT_SIGN`.
+- Signature có độ dài 64 bytes.
+- Trong binary có chuỗi `unsafe opcode`.
+- Payload `7f03` khi xin ký thì bị báo lỗi `unsafe opcode`.
 
-Mình tách exploit thành 3 script để dễ debug từng giai đoạn.
+Trước khi đi tiếp, mình cần kiểm tra lại xem script giao tiếp với server có chạy đúng không. Vì nếu chưa nói chuyện đúng protocol mà đã debug crypto thì rất dễ bị sai hướng.
 
-| Script | Mục đích |
-|---|---|
-| [`01_test_safe_signature.py`](./scripts/test.py) | Test protocol, handshake, tạo safe capsule và xin chữ ký hợp lệ |
-| [`02_factor_rsa_from_fault.py`](./scripts/factor.py) | Gây CRT fault, tính GCD, recover `p`, `q`, `d` |
-| [`03_solve_forge_unsafe_opcode.py`](./scripts/solve.py) | Dùng private key để ký opcode `0x7f` và lấy flag |
+Yêu cầu của script test ban đầu là:
+
+1. Dựa theo format trong `capsule.py`.
+2. Gửi frame đúng protocol.
+3. Tạo một capsule đơn giản, không chứa unsafe opcode.
+4. Xin chữ ký từ server.
+5. Kiểm tra chữ ký trả về có đúng 64 bytes hay không.
+
+Mình tạo một capsule test đơn giản, ví dụ chứa ký tự `A` và một opcode dừng chương trình, sau đó chuyển thành bytes để gửi lên server.
+
+Khi chạy script test, output cho thấy service phản hồi đúng như dự đoán:
+
+![python](./assets/13.png)
+
+```text
+[RECV banner] type=RT_OK seq=0 len=16
+    payload_hex  = 70617065722d6c616e7465726e2f7634
+    payload_text = 'paper-lantern/v4'
+
+[SEND HELLO strict] type=0x10 seq=0 len=1 payload=01
+[RECV after HELLO] type=RT_MODE seq=0 len=17
+    payload_text = 'attestation ready'
+
+[SEND ACK_STRICT] type=0x12 seq=1 len=0 payload=
+[RECV after ACK_STRICT] type=RT_MODE seq=0 len=14
+    payload_text = 'strict enabled'
+
+[SEND NEWCAP] type=0x20 seq=2 len=0 payload=
+[RECV after NEWCAP] type=RT_OK seq=0 len=15
+    payload_text = 'capsule created'
+
+[SEND APPEND capsule] type=0x21 seq=3 len=3 payload=01014103
+[RECV after APPEND] type=RT_OK seq=0 len=16
+    payload_text = 'records appended'
+
+[SEND SIGN] type=0x22 seq=4 len=0 payload=
+[RECV after SIGN] type=RT_SIG seq=0 len=64
+```
+
+Điểm quan trọng nhất ở đây là:
+
+```text
+[RECV after SIGN] type=RT_SIG seq=0 len=64
+```
+
+Nghĩa là server đã ký thành công capsule test và trả về signature dài đúng 64 bytes.
+
+Kết quả này xác nhận ba điều:
+
+1. Script client đã gửi đúng protocol.
+2. Cách tạo capsule cơ bản là đúng.
+3. Server thật sự dùng cơ chế signature 64 bytes như trong JSON.
+
+Nói cách khác, pipeline cơ bản đã hoạt động:
+
+```text
+HELLO
+  ↓
+ACK_STRICT
+  ↓
+NEWCAP
+  ↓
+APPEND capsule hợp lệ
+  ↓
+SIGN
+  ↓
+Nhận RT_SIG 64 bytes
+```
+
+Đây là bước rất quan trọng, vì nó chứng minh rằng lỗi sau này nếu có xảy ra thì không phải do mình gửi sai frame, mà là do nội dung capsule bị server chặn.
 
 ---
 
-## 18. Flag
+## 13. Thay capsule test bằng unsafe opcode `0x7f`
+
+Sau khi test thành công với capsule an toàn, mình thử lại với opcode đáng ngờ `0x7f`.
+
+Payload mình dùng là:
+
+```text
+7f03
+```
+
+Trong đó `0x7f` là opcode mình đang nghi ngờ, còn `0x03` là byte đi kèm theo format capsule/opcode.
+
+Khi gửi payload này bằng `FT_APPEND`, server vẫn chấp nhận:
+
+```text
+[SEND APPEND capsule] type=0x21 seq=3 len=2 payload=7f03
+[RECV after APPEND] type=RT_OK seq=0 len=16
+    payload_hex  = 7265636f72647320617070656e646564
+    payload_text = 'records appended'
+```
+
+Nhưng khi xin chữ ký bằng `FT_SIGN`, server trả lỗi:
+
+![python](./assets/14.png)
+
+```text
+[SEND SIGN] type=0x22 seq=4 len=0 payload=
+[RECV after SIGN] type=RT_ERR seq=0 len=13
+    payload_hex  = 756e73616665206f70636f6465
+    payload_text = 'unsafe opcode'
+
+[RESULT] SIGN ERROR: 'unsafe opcode'
+```
+
+Kết quả này xác nhận `0x7f` đúng là opcode bị chặn.
+
+Điều thú vị là server không chặn ngay ở bước `APPEND`. Nó cho phép append record vào capsule, nhưng đến lúc `SIGN` thì mới kiểm tra và báo:
+
+```text
+unsafe opcode
+```
+
+Luồng xử lý có thể hiểu như sau:
+
+```text
+APPEND 7f03
+    ↓
+Server lưu record vào capsule
+    ↓
+SIGN
+    ↓
+Server audit capsule trước khi ký
+    ↓
+Phát hiện opcode nguy hiểm
+    ↓
+Từ chối ký
+```
+
+Tới đây, bài toán trở nên rõ hơn:
+
+```text
+Mình cần chạy capsule chứa unsafe opcode 0x7f
+nhưng server không chịu ký capsule chứa opcode này.
+```
+
+Vậy hướng giải không thể là xin chữ ký trực tiếp từ server cho payload `7f03`.
+
+Thay vào đó, cần tìm cách tạo ra một chữ ký hợp lệ cho unsafe capsule mà không cần server ký trực tiếp payload đó.
+
+---
+
+## 14. Quay lại manh mối RSA
+
+Lúc này mình quay lại manh mối đã thấy trong `public_params.json`:
+
+```json
+"scheme": "crt-rsa-fdh",
+"e": 65537,
+"signature_size": 64
+```
+
+Vì server dùng RSA signature, mình cần hiểu lại RSA hoạt động như thế nào.
+
+RSA có public key:
+
+```text
+(n, e)
+```
+
+Trong đó:
+
+- `n` là modulus.
+- `e` là public exponent.
+
+Private key là:
+
+```text
+d
+```
+
+Khi ký message `m`, server dùng private key:
+
+```text
+signature = m^d mod n
+```
+
+Khi verify chữ ký, chương trình dùng public key:
+
+```text
+m = signature^e mod n
+```
+
+Nếu kết quả verify đúng với message cần kiểm tra, server tin rằng capsule này hợp lệ.
+
+Vấn đề là mình chỉ có public key `(n, e)`, còn private key `d` nằm trên server.
+
+Muốn tự ký unsafe capsule, mình cần có `d`.
+
+Trong RSA, để tính được `d`, cần biết `p` và `q` vì:
+
+```text
+n = p * q
+```
+
+Sau đó:
+
+```text
+phi(n) = (p - 1) * (q - 1)
+d = e^-1 mod phi(n)
+```
+
+Nói cách khác:
+
+```text
+Biết p, q
+    ↓
+Tính phi(n)
+    ↓
+Tính d
+    ↓
+Tự ký được capsule bất kỳ
+```
+
+Nhưng ở thời điểm này, mình chỉ biết `n`, chưa biết `p` và `q`.
+
+---
+
+## 15. Tìm hiểu CRT-RSA và fault attack
+
+Trong `public_params.json`, scheme là:
+
+```text
+crt-rsa-fdh
+```
+
+Phần `crt-rsa` khiến mình chú ý.
+
+RSA bình thường ký theo công thức:
+
+```text
+s = m^d mod n
+```
+
+Nhưng vì `n` rất lớn nên phép tính này khá chậm. Để tối ưu, người ta thường dùng CRT, tức là tách quá trình ký thành hai nhánh nhỏ hơn:
+
+```text
+sp = m^dp mod p
+sq = m^dq mod q
+```
+
+Sau đó ghép `sp` và `sq` lại để tạo ra chữ ký cuối cùng `s`.
+
+Có thể hiểu đơn giản:
+
+```text
+Thay vì giải một bài toán lớn modulo n
+        ↓
+CRT tách thành hai bài toán nhỏ modulo p và modulo q
+        ↓
+Sau đó ghép kết quả lại
+```
+
+Điểm yếu kinh điển của CRT-RSA là nếu một trong hai nhánh bị lỗi, chữ ký trả về có thể làm lộ `p` hoặc `q`.
+
+Ví dụ:
+
+```text
+n = p * q
+```
+
+Nếu lỗi chỉ xảy ra ở nhánh `p`, nhưng nhánh `q` vẫn đúng, thì chữ ký lỗi vẫn đúng theo modulo `q`.
+
+Điều đó có nghĩa là:
+
+```text
+s_fault^e ≡ m mod q
+```
+
+nhưng không đúng theo modulo `p`.
+
+Khi đó:
+
+```text
+s_fault^e - m
+```
+
+sẽ chia hết cho `q`.
+
+Vậy ta có thể lấy:
+
+```text
+g = gcd(s_fault^e - m, n)
+```
+
+Nếu may mắn, `g` sẽ trả về một factor của `n`, tức là `p` hoặc `q`.
+
+Đây chính là ý tưởng của RSA-CRT fault attack:
+
+```text
+Có chữ ký RSA-CRT bị lỗi
+        ↓
+Tính gcd(s_fault^e - m, n)
+        ↓
+Lộ p hoặc q
+        ↓
+Factor được n
+        ↓
+Tính private key d
+        ↓
+Forge chữ ký cho unsafe capsule
+```
+
+Tới đây mình nghi ngờ `gcd` sẽ là mấu chốt của bài. Nhưng câu hỏi còn lại là:
+
+```text
+Làm sao để khiến server tạo ra một chữ ký RSA-CRT bị lỗi?
+```
+
+---
+
+## 16. Quay lại `comment` và `replay_buf`
+
+Mình quay lại file Python đề cho và chú ý đến các hàm liên quan đến `comment`.
+
+Trong đó có các hàm như:
+
+![python](./assets/15.png)
+
+```python
+def comment_literal(data: bytes) -> bytes:
+    if not 1 <= len(data) <= 64:
+        raise ValueError("literal span must be between 1 and 64 bytes")
+    return bytes([(len(data) - 1)]) + data
+
+def comment_repeat(byte: int, count: int) -> bytes:
+    if not 0 <= byte <= 0xFF:
+        raise ValueError("repeat byte must fit in one byte")
+    if not 3 <= count <= 66:
+        raise ValueError("repeat span must be between 3 and 66 bytes")
+    return bytes([0x40 | (count - 3), byte])
+
+def comment_backref(distance: int, count: int) -> bytes:
+    if not 1 <= distance <= 0xFF:
+        raise ValueError("backref distance must be one byte")
+    if not 3 <= count <= 66:
+        raise ValueError("backref span must be between 3 and 66 bytes")
+    return bytes([0x80 | (count - 3), distance])
+
+def comment_xor(count: int, mask: int) -> bytes:
+    if not 1 <= count <= 32:
+        raise ValueError("xor span must be between 1 and 32 bytes")
+    if not 0 <= mask <= 0xFF:
+        raise ValueError("xor mask must fit in one byte")
+    return bytes([0xC0 | (count - 1), mask])
+
+def comment_braid_fill(count: int, value: int) -> bytes:
+    if not 17 <= count <= 32:
+        raise ValueError("braid span must be between 17 and 32 bytes")
+    if not 0 <= value <= 0xFF:
+        raise ValueError("fill byte must fit in one byte")
+    return bytes([0xE0 | (count - 17), value])
+```
+
+Nhìn các hàm này, mình hiểu rằng `comment` không chỉ là text bình thường. Nó giống một ngôn ngữ nhỏ để sửa hoặc dựng lại một vùng buffer nào đó.
+
+Các operation như:
+
+```text
+literal
+repeat
+backref
+xor
+braid_fill
+patch
+```
+
+cho thấy comment có thể tác động lên một buffer nội bộ, cụ thể là `replay buffer`.
+
+Điều này làm mình nhớ lại trong JSON có dòng:
+
+```json
+"replay_buf": 72
+```
+
+Tức là vùng replay buffer dài 72 bytes.
+
+Lúc này mình nghi ngờ bug nằm ở khu vực xử lý comment/replay:
+
+```text
+comment operations
+        ↓
+ghi vào replay buffer
+        ↓
+replay buffer dài 72 bytes
+        ↓
+nếu kiểm tra biên sai
+        ↓
+có thể ghi vượt khỏi buffer
+        ↓
+làm hỏng state phía sau
+        ↓
+có thể ảnh hưởng đến CRT-RSA signing
+```
+
+Vì replay buffer dài 72 bytes, nếu tính theo kiểu mảng trong C/C++ thì index hợp lệ là:
+
+```text
+0 .. 71
+```
+
+Byte hợp lệ cuối cùng là byte thứ `71`.
+
+Nếu có thể ghi tới byte thứ `72` hoặc xa hơn, tức là đã vượt khỏi vùng buffer:
+
+```text
+replay_buf[0]  ... replay_buf[71] | state phía sau
+                                ^
+                                byte hợp lệ cuối cùng
+
+replay_buf[72] trở đi
+        ↓
+out-of-bounds write
+```
+
+Vì vậy hướng tiếp theo của mình là thử tác động vào `comment` để ghi nhiều hơn 72 bytes, nhằm xem có thể làm thay đổi state phía sau replay buffer hay không.
+
+Nếu state phía sau có liên quan tới CRT signing, ta có thể tạo ra một chữ ký lỗi, sau đó dùng `gcd` để factor `n`.
+
+Tới đây, hướng khai thác được hình thành rõ hơn:
+
+```text
+Dùng comment/replay để gây corruption
+        ↓
+Làm CRT-RSA signing bị lỗi
+        ↓
+Nhận faulty signature
+        ↓
+Dùng gcd để khôi phục p hoặc q
+        ↓
+Tính private key
+        ↓
+Ký unsafe opcode 7f03
+        ↓
+Run capsule lấy flag
+```
+
+## 17. Tạo overflow nhỏ trong replay buffer
+
+Sau khi xác định bài dùng `crt-rsa-fdh`, mình quay lại phần comment/replay trong file Python để tìm cách tác động tới quá trình ký RSA.
+
+Ở đây có hai hàm đáng chú ý:
+
+![python](./assets/16.png)
+
+```python
+def comment_literal(data: bytes) -> bytes:
+    if not 1 <= len(data) <= 64:
+        raise ValueError("literal span must be between 1 and 64 bytes")
+    return bytes([(len(data) - 1)]) + data
+```
+
+và:
+
+![python](./assets/17.png)
+
+```python
+def comment_braid_fill(count: int, value: int) -> bytes:
+    if not 17 <= count <= 32:
+        raise ValueError("braid span must be between 17 and 32 bytes")
+    if not 0 <= value <= 0xFF:
+        raise ValueError("fill byte must fit in one byte")
+    return bytes([0xE0 | (count - 17), value])
+```
+
+Từ điều kiện kiểm tra, mình hiểu được:
+
+```text
+comment_literal:
+    ghi được từ 1 đến 64 bytes
+
+comment_braid_fill:
+    ghi được từ 17 đến 32 bytes
+```
+
+Trong file `public_params.json`, có dòng:
+
+```json
+"replay_buf": 72
+```
+
+Tức là replay buffer chỉ dài 72 bytes. Nếu tính giống mảng trong C/C++, index hợp lệ sẽ là:
+
+```text
+0 → 71
+```
+
+Byte cuối cùng hợp lệ là byte thứ `71`. Từ byte thứ `72` trở đi là đã vượt khỏi replay buffer.
+
+Vì `literal` cho phép ghi tối đa 64 bytes, còn `braid_fill` cho phép ghi tối thiểu 17 bytes, mình thử tạo một overflow nhỏ bằng cách:
+
+```text
+literal 60 bytes
++
+braid_fill 17 bytes
+=
+77 bytes
+```
+
+So với replay buffer 72 bytes:
+
+```text
+77 - 72 = 5 bytes
+```
+
+Tức là payload này có thể ghi vượt qua replay buffer một lượng nhỏ.
+
+Mình không chọn ghi tràn quá nhiều, vì nếu đè quá xa thì chương trình có thể crash hoặc phá hỏng state quan trọng. Mục tiêu của mình không phải làm server chết, mà là làm sai lệch nhẹ state nằm gần replay buffer để xem nó có ảnh hưởng đến quá trình ký RSA-CRT hay không.
+
+Ý tưởng lúc này là:
+
+```text
+Ghi gần đầy replay buffer
+        ↓
+Dùng braid_fill ghi thêm vài byte
+        ↓
+Vượt qua ranh giới replay_buf
+        ↓
+Đè state nằm phía sau buffer
+        ↓
+Quan sát chữ ký RSA trả về có bị lỗi không
+```
+
+---
+
+## 18. Brute force byte điều khiển để tạo faulty signature
+
+Ở thời điểm này mình chưa biết byte nào nằm sau replay buffer có tác dụng bật fault path. Vì vậy mình brute force một byte điều khiển, tạm gọi là `gate2`, trong khoảng:
+
+```text
+0x00 → 0xff
+```
+
+Mỗi lần thử một giá trị `gate2`, mình làm các bước sau:
+
+```text
+1. Xin một chữ ký bình thường
+2. Tạo replay overflow nhỏ bằng comment
+3. Thử một giá trị gate2
+4. Xin chữ ký lần nữa
+5. So sánh chữ ký mới với chữ ký bình thường
+6. Dùng gcd để kiểm tra có lộ factor của n không
+```
+
+Với RSA-CRT fault attack, nếu có:
+
+```text
+s_good  = chữ ký đúng
+s_fault = chữ ký lỗi
+```
+
+và lỗi chỉ xảy ra ở một nhánh CRT, thì hiệu giữa hai chữ ký sẽ chia hết cho một trong hai prime factor của `n`.
+
+Khi đó ta kiểm tra bằng:
+
+```python
+g = gcd(abs(s_good - s_fault), n)
+```
+
+Nếu:
+
+```text
+1 < g < n
+```
+
+thì `g` chính là một factor của `n`, tức là `p` hoặc `q`.
+
+Nói cách khác:
+
+```text
+gcd = 1      → chưa khai thác được gì
+gcd = n      → không lộ factor
+1 < gcd < n → factor được n
+```
+
+Đây chính là dấu hiệu cho thấy mình đã tạo được một faulty RSA-CRT signature.
+
+---
+
+## 19. Factor RSA modulus
+
+Sau khi brute force `gate2`, script tìm được faulty signature và factor được `n`.
+
+Chạy script:
+
+[tinh_pqd.py](./scripts/2.py)
+
+```bash
+python3 solve_paper_lantern.py 178.105.199.41 20000
+```
+
+Output:
+
+![python](./assets/19.png)
+
+
+```text
+[*] target 178.105.199.41:20000
+[*] asking for normal signature...
+[*] asking for faulty CRT signature...
+[+] factored n
+    p = 9da033fd0799399257825aff0f7ca4b7866a4db13e250be52e50d7fc3d3eb295
+    q = b6f7221baafa0048953633e0193e92928aab4bf4dba728b6f713e55135c0b6b5
+[+] private exponent
+    d = ...
+[+] saved key to paper_lantern_key.json
+```
+
+Tới đây, RSA modulus đã bị factor:
+
+```python
+p = 0x9da033fd0799399257825aff0f7ca4b7866a4db13e250be52e50d7fc3d3eb295
+q = 0xb6f7221baafa0048953633e0193e92928aab4bf4dba728b6f713e55135c0b6b5
+```
+
+Vì:
+
+```text
+n = p * q
+```
+
+nên khi đã biết `p` và `q`, mình có thể tính lại private exponent `d`.
+
+Công thức RSA là:
+
+```python
+phi = (p - 1) * (q - 1)
+d = inverse(e, phi)
+```
+
+Trong đó `e` lấy từ JSON:
+
+```python
+e = 65537
+```
+
+Sau bước này, mình đã có private key RSA. Việc save ra file JSON thật ra không bắt buộc, nhưng mình lưu lại để dễ kiểm tra và tái sử dụng trong các bước sau.
+
+---
+
+## 20. Forge chữ ký cho unsafe opcode
+
+Trước đó, khi xin server ký trực tiếp payload chứa opcode `0x7f`, server trả lỗi:
+
+```text
+unsafe opcode
+```
+
+Điều này có nghĩa là server không cho ký capsule chứa opcode nguy hiểm.
+
+Nhưng sau khi đã khôi phục được private key `d`, mình không cần xin server ký nữa. Mình có thể tự ký offline.
+
+Payload unsafe đã xác định trước đó là:
+
+```text
+7f03
+```
+
+Ý tưởng lúc này:
+
+```text
+Tạo capsule chứa opcode 0x7f
+        ↓
+Tính message/hash theo đúng scheme FDH
+        ↓
+Ký bằng private exponent d
+        ↓
+Gửi capsule + signature hợp lệ lên server
+        ↓
+Server verify bằng public key (n, e)
+        ↓
+Verify pass
+        ↓
+Server chạy unsafe opcode
+```
+
+Khi chạy phần forge forbidden capsule, script in ra thông tin capsule và signature:
+
+[solve.py](./scripts/3.py)
+
+![python](./assets/20.png)
+
+```text
+[+] signed forbidden capsule
+    canonical = b'\x7f'
+    unsafe_m = ...
+    sig      = ...
+[*] running forbidden opcode against 178.105.199.41:20000...
+```
+
+Cuối cùng server chấp nhận chữ ký đã forge và chạy opcode bị cấm.
+
+Output:
 
 ```text
 slopped{faulted_crt_seams_burn_open}
@@ -739,21 +1433,49 @@ slopped{faulted_crt_seams_burn_open}
 
 ---
 
-##
+## 21. Kết luận khai thác
 
-Mấu chốt bài này không phải là buffer overflow thông thường.
-
-Mấu chốt là:
+Toàn bộ hướng giải có thể tóm tắt như sau:
 
 ```text
-comment và replay buffer overflow
--> gây lỗi RSA-CRT signing
--> lấy faulty signature
--> dùng GCD tính n
--> tính private key d
--> forge signature cho unsafe opcode
--> chạy opcode 0x7f lấy flag
+Đọc public_params.json
+        ↓
+Nhận ra scheme = crt-rsa-fdh
+        ↓
+Biết service dùng RSA signature
+        ↓
+Tìm unsafe opcode 0x7f
+        ↓
+Server không cho ký trực tiếp unsafe opcode
+        ↓
+Phân tích comment/replay buffer
+        ↓
+Dùng literal + braid_fill tạo overflow nhỏ qua replay_buf 72 bytes
+        ↓
+Brute force gate2 để làm lỗi CRT signing
+        ↓
+Nhận faulty signature
+        ↓
+gcd(abs(s_good - s_fault), n) làm lộ p hoặc q
+        ↓
+Tính private key d
+        ↓
+Forge signature cho unsafe opcode
+        ↓
+Run capsule
+        ↓
+Lấy flag
 ```
+
+Mấu chốt của bài là bug nằm ở vùng xử lý replay/comment buffer. Overflow nhỏ không dùng để chiếm RIP hay crash chương trình, mà dùng để làm sai state của quá trình ký RSA-CRT. Khi CRT signing bị lỗi, chữ ký lỗi trở thành oracle làm lộ factor của RSA modulus.
+
+Flag:
+
+```text
+slopped{faulted_crt_seams_burn_open}
+```
+
+
 
 ---
 
