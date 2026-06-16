@@ -8,41 +8,62 @@
 - **Bug chính:** CRT-RSA fault attack
 - **Kết quả:** Solved
 
----
+## Recon ban đầu
 
-## 2. Recon ban đầu
-
-Đầu tiên mình kiểm tra thư mục đề bài:
+Đầu tiên, mình kiểm tra nhanh thư mục challenge để xem bài cung cấp những file gì:
 
 ```bash
 ls -la
-file *
-```
+````
+![recon__ban_dau](./assets/1)
 
-Trong thư mục có các file đáng chú ý như:
+Kết quả cho thấy challenge có ba file chính:
 
-```text
-paper_lantern
-capsule.py
-public_params.json
-```
+* Một file binary `paper_lantern`
+* Một file Python
+* Một file JSON
 
-Mình thử kiểm tra strings để xem trong binary có gì thú vị:
+Đây là dấu hiệu khá quen thuộc trong các bài CTF dạng Pwn/Crypto: binary thường là chương trình chính của challenge, file Python có thể là helper hoặc client mẫu, còn file JSON thường chứa dữ liệu cấu hình, public key, capsule mẫu hoặc signature mẫu.
+
+Tiếp theo, mình kiểm tra loại file của binary:
 
 ```bash
-strings paper_lantern | grep -i flag
-strings paper_lantern | grep -i slopped
+file paper_lantern
 ```
 
-Kết quả thấy có đường dẫn:
+Kết quả cho thấy `paper_lantern` là một file ELF binary và đã bị **strip**. Điều này có nghĩa là các symbol debug như tên hàm, tên biến đã bị xóa, khiến việc reverse trực tiếp binary khó hơn vì ta không còn các tên hàm rõ ràng để bám theo.
+
+Sau đó, mình đọc thử các file text đi kèm:
+
+```bash
+cat *.json
+cat *.py
+```
+
+Khi xem nội dung, chi tiết đầu tiên khiến mình chú ý là phần **signature** có độ dài **64 bytes**.
+
+Đây là một manh mối quan trọng. Signature 64 bytes tương ứng với một giá trị có kích thước 512-bit. Trong bối cảnh bài có cơ chế ký/xác thực capsule, điều này khiến mình nghi ngờ challenge đang sử dụng một dạng RSA nhỏ hoặc một cơ chế chữ ký có liên quan đến số nguyên lớn.
+
+Vì binary đã bị strip nên mình không đi thẳng vào reverse toàn bộ chương trình ngay. Thay vào đó, mình bắt đầu từ file JSON trước, vì JSON thường chứa các tham số dễ đọc hơn như public key, modulus, exponent, message mẫu hoặc signature mẫu.
+
+Hướng suy nghĩ lúc này là:
 
 ```text
-/app/flag.txt
+Có signature 64 bytes
+        ↓
+Khả năng cao liên quan đến RSA hoặc cơ chế ký số
+        ↓
+Cần xem JSON để tìm public parameters
+        ↓
+Sau đó mới quay lại binary để hiểu service kiểm tra chữ ký như thế nào
 ```
 
-Lúc này mình hiểu flag có khả năng nằm trên server, không phải flag nằm sẵn trong file local.
+Tóm lại, ở bước recon ban đầu, mình xác định được ba điểm quan trọng:
 
-![Recon files](./assets/1.png)
+1. Challenge có binary chính `paper_lantern`.
+2. Binary đã bị strip nên reverse trực tiếp sẽ khó hơn.
+3. File JSON chứa signature 64 bytes, đây là manh mối mạnh cho hướng phân tích signature.
+
 
 ---
 
